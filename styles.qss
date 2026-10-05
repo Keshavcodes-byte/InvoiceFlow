@@ -1,0 +1,87 @@
+QMainWindow{
+    background:#F4F7FB;
+}
+
+/* Scrollbar */
+
+QScrollBar:vertical{
+    background:transparent;
+    width:10px;
+    margin:6px;
+}
+
+QScrollBar::handle:vertical{
+    background:#A5B4FC;
+    border-radius:5px;
+}
+
+QScrollBar::handle:vertical:hover{
+    background:#2563EB;
+}
+
+QScrollBar::add-line,
+QScrollBar::sub-line{
+    height:0;
+}
+
+/* Tooltips */
+
+QToolTip{
+    background:white;
+    color:#111827;
+    border:1px solid #E5E7EB;
+    padding:6px;
+}
+
+/* Primary Button */
+
+QPushButton#primaryBtn{
+    background:#2563EB;
+    color:white;
+    border:none;
+    border-radius:16px;
+    padding:14px 24px;
+    font-size:16px;
+    font-weight:700;
+}
+
+QPushButton#primaryBtn:hover{
+    background:#1D4ED8;
+}
+
+QPushButton#primaryBtn:pressed{
+    background:#1E40AF;
+}
+
+/* Success Button */
+
+QPushButton#successBtn{
+    background:#16A34A;
+    color:white;
+    border:none;
+    border-radius:16px;
+    padding:16px;
+    font-size:18px;
+    font-weight:800;
+}
+
+QPushButton#successBtn:hover{
+    background:#15803D;
+}
+
+QPushButton#successBtn:pressed{
+    background:#166534;
+}
+
+QFrame#hoverCard{
+    background:white;
+    border:1px solid #E5E7EB;
+    border-radius:22px;
+}
+
+QLabel#liveStatus{
+    color:#16A34A;
+    font-size:12px;
+    font-weight:800;
+}
+
