@@ -1,6 +1,11 @@
 from dataclasses import dataclass
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
+from numbers import Real
 from pathlib import Path
+from typing import Mapping
 import math
+import json
 import os
 import re
 import tempfile
@@ -58,6 +63,27 @@ FIELD_ALIASES = {
     ],
 }
 
+# Extended fields are used by mapping and grouping workflows. The existing
+# single-amount PDF path continues to use FIELD_ALIASES for compatibility.
+EXTENDED_FIELD_ALIASES = {
+    "item_description": [
+        "item description", "description", "product description",
+        "item", "product", "service",
+    ],
+    "quantity": ["quantity", "qty", "units"],
+    "unit_price": ["unit price", "price per unit", "rate per unit"],
+    "discount": ["discount", "discount amount", "discount rate"],
+    "tax_rate": ["tax rate", "tax %", "gst rate", "vat rate"],
+    "customer_email": ["customer email", "client email", "email", "e-mail"],
+    "currency": ["currency", "currency code"],
+}
+CANONICAL_FIELD_ALIASES = {**FIELD_ALIASES, **EXTENDED_FIELD_ALIASES}
+REQUIRED_SINGLE_AMOUNT_FIELDS = ("name", "amount")
+OPTIONAL_INVOICE_FIELDS = tuple(
+    field for field in CANONICAL_FIELD_ALIASES
+    if field not in REQUIRED_SINGLE_AMOUNT_FIELDS
+)
+
 
 FIELD_LABELS = {
     "invoice_number": "invoice number",
@@ -65,7 +91,39 @@ FIELD_LABELS = {
     "address": "address",
     "date": "date",
     "amount": "amount",
+    "item_description": "item description",
+    "quantity": "quantity",
+    "unit_price": "unit price",
+    "discount": "discount",
+    "tax_rate": "tax rate",
+    "customer_email": "customer email",
+    "currency": "currency",
 }
+
+
+@dataclass(frozen=True)
+class ColumnMapping:
+    """Explicit mapping from canonical invoice fields to source headers."""
+
+    field_to_column: Mapping[str, object]
+
+    def as_dict(self):
+        return dict(self.field_to_column)
+
+    def validate(self, source_columns, required_fields=REQUIRED_SINGLE_AMOUNT_FIELDS):
+        return validate_column_mapping(
+            self.field_to_column,
+            source_columns=source_columns,
+            required_fields=required_fields,
+        )
+
+
+@dataclass(frozen=True)
+class InvoiceRowGroup:
+    """A stable, ordered group of source rows belonging to one invoice."""
+
+    invoice_id: str
+    rows: pd.DataFrame
 
 
 def normalize_column_name(column):
@@ -87,6 +145,138 @@ def _is_blank(value):
     return isinstance(value, str) and not value.strip()
 
 
+def normalize_text_value(value):
+    """Trim text and map conventional null tokens to None without recasing."""
+    if _is_blank(value):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if value.casefold() in {"null", "none", "nan"}:
+            return None
+        return value
+    return value
+
+
+def normalize_date_value(value, input_format=None, output_format="%d-%m-%Y"):
+    """Normalize dates; absent a format, accept ISO dates/timestamps only."""
+    value = normalize_text_value(value)
+    if value is None:
+        return ""
+
+    if isinstance(value, pd.Timestamp):
+        parsed = value.to_pydatetime()
+    elif isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, date):
+        parsed = datetime.combine(value, datetime.min.time())
+    elif isinstance(value, str):
+        try:
+            parsed = (
+                datetime.strptime(value, input_format)
+                if input_format
+                else datetime.fromisoformat(value.replace("Z", "+00:00"))
+            )
+        except ValueError as error:
+            if input_format is None:
+                reason = "ambiguous or invalid; provide input_format explicitly"
+            else:
+                reason = f"does not match format {input_format!r}"
+            raise ValueError(f"Invalid invoice date {value!r}: {reason}.") from error
+    else:
+        raise ValueError(f"Invalid invoice date value: {value!r}.")
+
+    return parsed.strftime(output_format)
+
+
+def normalize_numeric_value(
+    value,
+    *,
+    field="number",
+    decimal_separator=None,
+    thousands_separator=None,
+    currency_symbol=None,
+):
+    """Parse a finite Decimal with explicit policy for separated strings.
+
+    Plain integer strings and numeric Python values are unambiguous. Strings
+    containing punctuation require a declared decimal separator; grouping
+    punctuation is validated rather than silently removed.
+    """
+    if isinstance(value, Real) and not isinstance(value, bool) and not math.isfinite(value):
+        raise ValueError(f"Invalid {field}: value must be finite.")
+    if isinstance(value, Decimal) and not value.is_finite():
+        raise ValueError(f"Invalid {field}: value must be finite.")
+    value = normalize_text_value(value)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"Invalid {field}: boolean values are not numeric.")
+
+    if isinstance(value, Decimal):
+        result = value
+    elif isinstance(value, Real):
+        try:
+            result = Decimal(str(value))
+        except InvalidOperation as error:
+            raise ValueError(f"Invalid {field}: {value!r}.") from error
+    elif isinstance(value, str):
+        text = value.strip()
+        if currency_symbol:
+            if text.startswith(currency_symbol):
+                text = text[len(currency_symbol):].strip()
+        elif re.search(r"[₹$€£]|\b(?:INR|USD|EUR|GBP|Rs\.?|Rs)\b", text, re.I):
+            raise ValueError(
+                f"Invalid {field}: currency prefix requires an explicit currency_symbol."
+            )
+
+        if any(separator in text for separator in ".,"):
+            if decimal_separator not in {".", ","}:
+                raise ValueError(
+                    f"Ambiguous separators in {field} {value!r}; "
+                    "provide decimal_separator explicitly."
+                )
+            if thousands_separator not in {None, ".", ","}:
+                raise ValueError("thousands_separator must be '.' or ','.")
+            if thousands_separator == decimal_separator:
+                raise ValueError("Decimal and thousands separators must differ.")
+
+            signless = text[1:] if text.startswith(("+", "-")) else text
+            if signless.count(decimal_separator) > 1:
+                raise ValueError(f"Invalid {field} separators: {value!r}.")
+            integer_part, separator, fraction_part = signless.partition(decimal_separator)
+            if separator and (not fraction_part or not fraction_part.isdigit()):
+                raise ValueError(f"Invalid {field} fractional part: {value!r}.")
+            if thousands_separator and thousands_separator in integer_part:
+                groups = integer_part.split(thousands_separator)
+                if (
+                    not 1 <= len(groups[0]) <= 3
+                    or not groups[0].isdigit()
+                    or any(len(group) != 3 or not group.isdigit() for group in groups[1:])
+                ):
+                    raise ValueError(f"Invalid {field} thousands grouping: {value!r}.")
+                integer_part = "".join(groups)
+            elif not integer_part.isdigit():
+                raise ValueError(f"Invalid {field}: {value!r}.")
+
+            canonical = ("-" if text.startswith("-") else "") + integer_part
+            if separator:
+                canonical += "." + fraction_part
+            text = canonical
+        elif not re.fullmatch(r"[+-]?\d+", text):
+            raise ValueError(f"Invalid {field}: {value!r}.")
+
+        try:
+            result = Decimal(text)
+        except InvalidOperation as error:
+            raise ValueError(f"Invalid {field}: {value!r}.") from error
+    else:
+        raise ValueError(f"Invalid {field}: {value!r}.")
+
+    if not result.is_finite():
+        raise ValueError(f"Invalid {field}: value must be finite.")
+    return result
+
+
 def _header_score(row):
     values = row.dropna().astype(str).str.strip()
     values = values[values != ""]
@@ -95,7 +285,7 @@ def _header_score(row):
 
     known_headers = {
         normalize_column_name(alias)
-        for aliases in FIELD_ALIASES.values()
+        for aliases in CANONICAL_FIELD_ALIASES.values()
         for alias in aliases
     }
 
@@ -139,7 +329,7 @@ def detect_header_row(file_path):
                 f"Could not inspect the Excel header: {error}"
             ) from error
     else:
-        raise ValueError("Unsupported file format. Use Excel or CSV.")
+        raise ValueError("Header detection supports CSV and Excel files only.")
 
     best_row = 0
     best_score = float("-inf")
@@ -152,6 +342,19 @@ def detect_header_row(file_path):
     return best_row
 
 
+def _json_object_without_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate JSON field name: {key!r}.")
+        result[key] = value
+    return result
+
+
+def _reject_nonstandard_json_constant(value):
+    raise ValueError(f"Unsupported non-standard JSON numeric constant: {value}.")
+
+
 def read_input_file(file_path):
     path = Path(file_path)
 
@@ -161,8 +364,50 @@ def read_input_file(file_path):
         raise ValueError("The selected input path is not a file.")
 
     suffix = path.suffix.lower()
-    if suffix not in {".csv", ".xlsx", ".xls"}:
-        raise ValueError("Unsupported file format. Use Excel or CSV.")
+    if suffix not in {".csv", ".xlsx", ".xls", ".json"}:
+        raise ValueError("Unsupported file format. Use CSV, Excel, or JSON.")
+
+    if suffix == ".json":
+        try:
+            with path.open("r", encoding="utf-8-sig") as json_file:
+                payload = json.load(
+                    json_file,
+                    object_pairs_hook=_json_object_without_duplicate_keys,
+                    parse_constant=_reject_nonstandard_json_constant,
+                )
+        except (OSError, UnicodeError, ValueError) as error:
+            raise ValueError(f"Could not read the selected JSON file: {error}") from error
+
+        if isinstance(payload, dict) and set(payload) == {"invoices"}:
+            records = payload["invoices"]
+        elif isinstance(payload, list):
+            records = payload
+        else:
+            raise ValueError(
+                "Unsupported JSON structure. Use an array of invoice objects "
+                "or an object containing an 'invoices' array."
+            )
+
+        if not isinstance(records, list) or not records:
+            raise ValueError("The selected JSON file contains no invoice records.")
+        if any(not isinstance(record, dict) for record in records):
+            raise ValueError("Each JSON invoice record must be an object.")
+        if any(
+            not isinstance(key, str)
+            or isinstance(value, (dict, list))
+            for record in records
+            for key, value in record.items()
+        ):
+            raise ValueError(
+                "JSON invoice records must use string field names and scalar values."
+            )
+        df = pd.DataFrame.from_records(records)
+        if df.empty or len(df.columns) == 0:
+            raise ValueError("The selected JSON file contains no invoice records.")
+        df = df.dropna(how="all").reset_index(drop=True)
+        if df.empty:
+            raise ValueError("The selected JSON file contains no invoice records.")
+        return df
 
     try:
         header_row = detect_header_row(path)
@@ -189,7 +434,7 @@ def read_input_file(file_path):
 
 
 def find_column(df, field):
-    if field not in FIELD_ALIASES:
+    if field not in CANONICAL_FIELD_ALIASES:
         raise ValueError(f"Unknown invoice field: {field}")
 
     normalized_columns = {}
@@ -198,7 +443,42 @@ def find_column(df, field):
         if normalized:
             normalized_columns.setdefault(normalized, []).append(column)
 
-    aliases = [normalize_column_name(alias) for alias in FIELD_ALIASES[field]]
+    aliases = [
+        normalize_column_name(alias)
+        for alias in CANONICAL_FIELD_ALIASES[field]
+    ]
+    alias_set = set(aliases)
+
+    duplicate_exact_headers = [
+        column_name
+        for column_name, original_columns in normalized_columns.items()
+        if column_name in alias_set and len(original_columns) > 1
+    ]
+    if duplicate_exact_headers:
+        label = FIELD_LABELS[field]
+        columns = ", ".join(str(column) for column in duplicate_exact_headers)
+        raise ValueError(
+            f"Ambiguous {label} columns found: {columns}. "
+            "Please keep only one matching column."
+        )
+
+    if field == "name":
+        # "Customer" and "Customer Name" are both exact aliases, so neither
+        # should silently win merely because its alias is more specific.
+        exact_columns = list(dict.fromkeys(
+            column
+            for column_name, original_columns in normalized_columns.items()
+            if column_name in alias_set
+            for column in original_columns
+        ))
+        if len(exact_columns) > 1:
+            label = FIELD_LABELS[field]
+            columns = ", ".join(str(column) for column in exact_columns)
+            raise ValueError(
+                f"Ambiguous {label} columns found: {columns}. "
+                "Please keep only one matching column."
+            )
+
     candidates = []
 
     for column_name, original_columns in normalized_columns.items():
@@ -230,14 +510,53 @@ def find_column(df, field):
 
 
 def map_columns(df):
+    """Return legacy workflow mappings without changing its public shape."""
     return {
         field: find_column(df, field)
         for field in FIELD_ALIASES
     }
 
 
-def validate_mapping(mapping):
-    required_fields = ("name", "amount")
+def suggest_column_mapping(df):
+    """Suggest mappings for all supported canonical invoice fields."""
+    return ColumnMapping({
+        field: find_column(df, field)
+        for field in CANONICAL_FIELD_ALIASES
+    })
+
+
+def validate_column_mapping(
+    mapping,
+    source_columns=None,
+    required_fields=REQUIRED_SINGLE_AMOUNT_FIELDS,
+):
+    unknown_fields = [field for field in mapping if field not in CANONICAL_FIELD_ALIASES]
+    if unknown_fields:
+        raise ValueError(f"Unknown invoice mapping fields: {', '.join(unknown_fields)}")
+    unknown_required = [
+        field for field in required_fields if field not in CANONICAL_FIELD_ALIASES
+    ]
+    if unknown_required:
+        raise ValueError(
+            f"Unknown required invoice fields: {', '.join(unknown_required)}"
+        )
+
+    if source_columns is not None:
+        source_columns = list(source_columns)
+        missing_columns = [
+            str(column)
+            for column in mapping.values()
+            if column is not None and column not in source_columns
+        ]
+        if missing_columns:
+            raise ValueError(
+                "Mapped source columns were not found: " + ", ".join(missing_columns)
+            )
+
+    chosen_columns = [column for column in mapping.values() if column is not None]
+    if len(chosen_columns) != len(set(chosen_columns)):
+        raise ValueError("A source column cannot be mapped to multiple invoice fields.")
+
     missing_fields = [
         field for field in required_fields
         if mapping.get(field) is None
@@ -247,7 +566,90 @@ def validate_mapping(mapping):
         missing = ", ".join(FIELD_LABELS[field] for field in missing_fields)
         raise ValueError(f"Required invoice columns not found: {missing}")
 
-    return mapping
+    return dict(mapping)
+
+
+def apply_column_overrides(df, overrides, suggestions=None):
+    """Apply manual field-to-header choices to automatic mapping suggestions."""
+    unknown_fields = [field for field in overrides if field not in CANONICAL_FIELD_ALIASES]
+    if unknown_fields:
+        raise ValueError(f"Unknown invoice mapping fields: {', '.join(unknown_fields)}")
+    if suggestions is None:
+        # A manual choice must be able to resolve ambiguity for that same
+        # field, so do not attempt automatic detection for overridden fields.
+        mapping = {
+            field: None if field in overrides else find_column(df, field)
+            for field in CANONICAL_FIELD_ALIASES
+        }
+    else:
+        mapping = (
+            suggestions.as_dict()
+            if isinstance(suggestions, ColumnMapping)
+            else dict(suggestions)
+        )
+    mapping.update(overrides)
+    validate_column_mapping(mapping, source_columns=df.columns)
+    return ColumnMapping(mapping)
+
+
+def validate_mapping(mapping):
+    return validate_column_mapping(mapping)
+
+
+def group_invoice_rows(
+    df,
+    invoice_id_column,
+    invoice_level_columns=(),
+):
+    """Group rows by invoice ID in encounter order and reject conflicts.
+
+    ``invoice_level_columns`` names source headers whose nonblank values must
+    agree within a group. Item rows retain their original relative order.
+    """
+    if df is None or df.empty:
+        raise ValueError("Cannot group an empty invoice data set.")
+    if invoice_id_column not in df.columns:
+        raise ValueError(f"Invoice grouping column not found: {invoice_id_column}")
+
+    invoice_level_columns = tuple(invoice_level_columns or ())
+    missing_columns = [column for column in invoice_level_columns if column not in df.columns]
+    if missing_columns:
+        raise ValueError(
+            "Invoice-level columns not found: "
+            + ", ".join(str(column) for column in missing_columns)
+        )
+
+    grouped_positions = {}
+    normalized_values = {}
+    for position in range(len(df)):
+        row = df.iloc[position]
+        raw_key = normalize_text_value(row[invoice_id_column])
+        if raw_key is None:
+            raise ValueError(
+                f"Missing invoice identifier in row {position + 2} "
+                f"({invoice_id_column})."
+            )
+        key = str(raw_key)
+        grouped_positions.setdefault(key, []).append(position)
+        normalized_values.setdefault(key, {column: [] for column in invoice_level_columns})
+
+        for column in invoice_level_columns:
+            value = normalize_text_value(row[column])
+            if value is not None and value not in normalized_values[key][column]:
+                normalized_values[key][column].append(value)
+
+    for key, fields in normalized_values.items():
+        conflicts = [column for column, values in fields.items() if len(values) > 1]
+        if conflicts:
+            raise ValueError(
+                f"Conflicting invoice-level values for invoice {key!r}: "
+                + ", ".join(str(column) for column in conflicts)
+            )
+
+    return [
+        InvoiceRowGroup(invoice_id=key, rows=df.iloc[positions].copy())
+        for key, positions in grouped_positions.items()
+    ]
 
 
 def normalize_invoice_date(value):

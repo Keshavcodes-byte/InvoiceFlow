@@ -1,11 +1,28 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks.tcl_tk import tcltk_info
+
+
+datas = [('web/index.html', 'web')]
+binaries = []
+
+# Keep Tcl/Tk's standard relative layout inside the frozen bundle. Tk's
+# pkgIndex.tcl resolves its Windows DLL from ../../bin/tk86t.dll.
+if tcltk_info.available and tcltk_info.tcl_data_dir and tcltk_info.tk_data_dir:
+    tcl_major, tcl_minor = tcltk_info.tcl_version
+    tk_major, tk_minor = tcltk_info.tk_version
+    datas.extend([
+        (tcltk_info.tcl_data_dir, f'tcl/tcl{tcl_major}.{tcl_minor}'),
+        (tcltk_info.tk_data_dir, f'tcl/tk{tk_major}.{tk_minor}'),
+    ])
+    if tcltk_info.tk_shared_library:
+        binaries.append((tcltk_info.tk_shared_library, 'bin'))
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
-    datas=[('styles.qss', '.')],
+    binaries=binaries,
+    datas=datas,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
